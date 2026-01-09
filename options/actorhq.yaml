@@ -1,0 +1,32 @@
+# datapath
+rootpath: "/data/actorshq"
+dataset: "avatarhq"
+scene: "Actor07"
+exp: "Actor07"
+target_size: 5000
+group: output-actorhq
+pose_idx: 0
+cuda: 0
+
+### visualization ###
+vis_idx: [1]
+
+### optimization ###
+distance: false # use distance-based adjacency matrix for mesh
+lambda_initial: 1
+pos_scale: 0.1
+
+### application ###
+vis: false
+app: "vis"
+other_path: ""
+
+### set iterations ###
+global_iter: 0 # large lr for global translation/rotation/scale
+deform_iter: 1000 # to start optimize scale/opacity of gs
+d_iter: 3000 # to switch to 3dgs
+vertice_iter: 2000 # to stop vertice realignment
+last_iter: 5000 # iteration to switch to 2dgs
+total_iter: 10000 # total iteration
+
+sh: false # disable spherical harmonics can give better geometry results

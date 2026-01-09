@@ -1,0 +1,33 @@
+# datapath
+rootpath: "/data/blender"
+dataset: "blender"
+scene: "bust"
+exp: "bust"
+target_size: 5000 # target size of texture map
+group: "output-blender"
+
+### visualization ###
+vis_idx: [1]
+
+### optimization ###
+cuda: 0
+distance: true # use distance-based adjacency matrix for mesh
+lambda_initial: 1 # lambda for gradient diffusion
+pos_scale: 1 # scale of the scene, currently consider the scene is about 1m radius
+
+### application ###
+vis: false
+app: "vis"
+other_path: ""
+
+#### set iterations ###
+global_iter: 200 # only optimize global translation/rotation/scale
+deform_iter: 3000 # to start optimize scale/opacity of gs
+d_iter: 15000 # to switch to 3dgs
+vertice_iter: 20000 # to stop vertice realignment
+last_iter: 5000 # iteration to switch to 2dgs
+total_iter: 40000 # total iteration
+
+### ablation ###
+no_3d: False # disable 3dgs
+sh: False # disable spherical harmonics
