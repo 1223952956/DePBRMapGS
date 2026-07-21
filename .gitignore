@@ -179,3 +179,11 @@ pyrightconfig.json
 output*/
 SMPLX_*
 OUT
+
+# dataset
+book
+box
+buddha
+bust
+cat
+tree

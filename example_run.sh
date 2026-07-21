@@ -1,6 +1,6 @@
 # !/bin/bash
 
-rootpath=/Data/blender_scenes
+rootpath=/mimlab/ren/project/demapgs/DeMapGS
 scene=buddha
 
 # train
