@@ -1,0 +1,55 @@
+# datapath
+rootpath: "/mimlab/ren/project/demapgs/DeMapGS"
+dataset: "blender"
+scene: "tree"
+
+# 使用独立输出，避免覆盖原实验
+exp: "tree_pbr_test"
+group: "output-blender"
+
+# smoke test 不需要 5000×5000 UV 投影
+target_size: 512
+
+### visualization ###
+vis_idx: [1]
+
+### optimization ###
+cuda: 0
+distance: true
+lambda_initial: 1
+pos_scale: 1
+
+### application ###
+vis: false
+app: "vis"
+other_path: ""
+
+### PBR appearance ###
+appearance_mode: pbr
+
+### lighting ###
+num_lights: 8
+light_start_iter: 0
+
+light_direction_lr: 0.0001
+light_lr: 0.001
+exposure_lr: 0.001
+white_balance_lr: 0.0005
+
+### short smoke-test schedule ###
+global_iter: 0
+deform_iter: 20
+
+# 当前测试不切换 3DGS
+d_iter: 1000
+no_3d: true
+
+# 先关闭 vertex realignment / attach_splat，
+# 单独验证基础 PBR 梯度链路
+vertice_iter: 0
+
+last_iter: 20
+total_iter: 100
+
+### legacy compatibility ###
+sh: false

@@ -1,0 +1,54 @@
+# datapath
+rootpath: "/mimlab/ren/project/demapgs/DeMapGS"
+dataset: "blender"
+scene: "tree"
+
+# Use an independent output directory; this stage starts from scratch.
+exp: "tree_pbr_stage2"
+group: "output-blender"
+
+# Keep UV export inexpensive during the lifecycle test.
+target_size: 512
+
+### visualization ###
+vis_idx: [1]
+
+### optimization ###
+cuda: 0
+distance: true
+lambda_initial: 1
+pos_scale: 1
+
+### application ###
+vis: false
+app: "vis"
+other_path: ""
+
+### PBR appearance ###
+appearance_mode: "pbr"
+
+### lighting ###
+num_lights: 8
+light_start_iter: 0
+light_direction_lr: 0.0001
+light_lr: 0.001
+exposure_lr: 0.001
+white_balance_lr: 0.0005
+
+### stage-2 lifecycle test ###
+# Optimize all Gaussian parameters after a short warm-up.
+global_iter: 0
+deform_iter: 20
+
+# Stay in 2DGS so this test isolates vertex realignment and attach_splat.
+d_iter: 1000
+no_3d: true
+
+# revise_vertices/attach_splat runs every 50 iterations while iter < 250.
+vertice_iter: 250
+
+last_iter: 50
+total_iter: 300
+
+### legacy compatibility ###
+sh: false

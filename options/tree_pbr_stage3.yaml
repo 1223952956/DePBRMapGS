@@ -1,0 +1,58 @@
+# datapath
+rootpath: "/mimlab/ren/project/demapgs/DeMapGS"
+dataset: "blender"
+scene: "tree"
+
+# Independent output for the densification/pruning test.
+exp: "tree_pbr_stage3_densify"
+group: "output-blender"
+
+# Keep UV projection inexpensive during validation.
+target_size: 512
+
+### visualization ###
+vis_idx: [1]
+
+### optimization ###
+cuda: 0
+distance: true
+lambda_initial: 1
+pos_scale: 1
+
+### application ###
+vis: false
+app: "vis"
+other_path: ""
+
+### PBR appearance ###
+appearance_mode: "pbr"
+
+### lighting ###
+num_lights: 8
+light_start_iter: 0
+light_direction_lr: 0.0001
+light_lr: 0.001
+exposure_lr: 0.001
+white_balance_lr: 0.0005
+
+### stage-3 densification/pruning test ###
+global_iter: 0
+deform_iter: 20
+
+# Keep this test on 2DGS to isolate Gaussian lifecycle behavior.
+d_iter: 10000
+no_3d: true
+
+# Exercise vertex realignment around both densification events.
+vertice_iter: 500
+
+# Enable surface-normal/distortion losses during the final 500 steps.
+last_iter: 500
+
+# Current code densifies every 200 steps only while:
+# iter > deform_iter and iter < total_iter - 5000.
+# With 5600 iterations, densify_and_prune runs at iter 200 and 400.
+total_iter: 5600
+
+### legacy compatibility ###
+sh: false

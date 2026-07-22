@@ -35,7 +35,12 @@ class GaussianModelBase:
         self.optim_params = OptimizationParams()
         self.active_sh_degree = 0
         self.max_sh_degree = 3
-        self.sh = opt.sh
+        self.appearance_mode = getattr(
+            opt,
+            "appearance_mode",
+            "sh" if getattr(opt, "sh", False) else "rgb",
+        )
+        self.sh = self.appearance_mode == "sh"
         self.spatial_lr_scale = 1
         self.percent_dense = 0.005
         self.indices = mesh.indices
@@ -109,10 +114,21 @@ class GaussianModelBase:
             "rotations": self.get_rotation(normals),
             "max_sh_degree": self.active_sh_degree,
         }
-        if not self.sh:
+        if self.appearance_mode == "pbr":
+            res.update(
+                {
+                    "normals": normals,
+                    "albedo": self.get_albedo,
+                    "roughness": self.get_roughness,
+                    "metallic": self.get_metallic,
+                }
+            )
+        elif self.appearance_mode == "rgb":
             res["colors"] = self.get_colors()
-        else:
+        elif self.appearance_mode == "sh":
             res["shs"] = self.get_colors()
+        else:
+            raise ValueError(f"Unsupported appearance mode: {self.appearance_mode}")
         return res
 
     def get_rotation(self, normals):
@@ -130,10 +146,25 @@ class GaussianModelBase:
         return surface_quat
 
     def get_colors(self, xyzs=None, camera=None):
-        if self.sh:
+        if self.appearance_mode == "sh":
             return torch.cat((self._features_dc, self._features_rest), dim=1)
-        else:
+        if self.appearance_mode == "rgb":
             return torch.sigmoid(self._colors)
+        raise ValueError(
+            f"get_colors() is not available in {self.appearance_mode} mode"
+        )
+
+    @property
+    def get_albedo(self):
+        return torch.sigmoid(self._albedo)
+
+    @property
+    def get_roughness(self):
+        return 0.04 + 0.96 * torch.sigmoid(self._roughness)
+
+    @property
+    def get_metallic(self):
+        return torch.sigmoid(self._metallic)
 
     @property
     def get_opacity(self):
@@ -160,7 +191,49 @@ class GaussianModelVis(GaussianModelBase):
 
     def restore(self, load_dir, arg):
         print("--- restore Gaussian: ", load_dir, "---")
-        loaded1 = torch.load(load_dir)
+        checkpoint = torch.load(load_dir)
+
+        if isinstance(checkpoint, dict):
+            self._restore_dict_checkpoint(checkpoint)
+        elif isinstance(checkpoint, (tuple, list)):
+            self._restore_legacy_checkpoint(checkpoint)
+        else:
+            raise TypeError(
+                "Unsupported Gaussian checkpoint type: "
+                f"{type(checkpoint).__name__}."
+            )
+
+        self._validate_appearance_parameters()
+        self._freeze_parameters()
+
+    def _restore_dict_checkpoint(self, checkpoint):
+        self.appearance_mode = checkpoint.get(
+            "appearance_mode", self.appearance_mode
+        )
+        self.sh = self.appearance_mode == "sh"
+
+        self.vertices = checkpoint["vertices"]
+        self._offset = checkpoint["offset"]
+        self._colors = checkpoint.get("colors")
+        self._features_dc = checkpoint.get("features_dc")
+        self._features_rest = checkpoint.get("features_rest")
+        self.scales = checkpoint["scales"]
+        self._opacity = checkpoint["opacity"]
+        self._rotation = checkpoint["rotation"]
+        self.faces = checkpoint["faces"]
+        self.indices = checkpoint["indices"]
+        self.curr_bary = checkpoint["curr_bary"]
+        self._albedo = checkpoint.get("albedo")
+        self._roughness = checkpoint.get("roughness")
+        self._metallic = checkpoint.get("metallic")
+
+    def _restore_legacy_checkpoint(self, checkpoint):
+        if len(checkpoint) != 11:
+            raise ValueError(
+                "Unsupported legacy Gaussian checkpoint with "
+                f"{len(checkpoint)} entries; expected 11."
+            )
+
         (
             self.vertices,
             self._offset,
@@ -173,13 +246,44 @@ class GaussianModelVis(GaussianModelBase):
             self.faces,
             self.indices,
             self.curr_bary,
-        ) = loaded1
-        self.vertices.requires_grad_(False)
-        self._offset.requires_grad_(False)
-        self._colors.requires_grad_(False)
-        self.scales.requires_grad_(False)
-        self._opacity.requires_grad_(False)
-        self._rotation.requires_grad_(False)
+        ) = checkpoint
+        self._albedo = None
+        self._roughness = None
+        self._metallic = None
+
+    def _validate_appearance_parameters(self):
+        if self.appearance_mode == "pbr":
+            missing = [
+                name
+                for name, value in (
+                    ("albedo", self._albedo),
+                    ("roughness", self._roughness),
+                    ("metallic", self._metallic),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(
+                    "PBR checkpoint is missing required parameters: "
+                    + ", ".join(missing)
+                )
+
+    def _freeze_parameters(self):
+        for tensor in (
+            self.vertices,
+            self._offset,
+            self._colors,
+            self._features_dc,
+            self._features_rest,
+            self.scales,
+            self._opacity,
+            self._rotation,
+            self._albedo,
+            self._roughness,
+            self._metallic,
+        ):
+            if tensor is not None:
+                tensor.requires_grad_(False)
 
 
 class GaussianModelEditColor(GaussianModelVis):
@@ -213,7 +317,7 @@ class GaussianModelEditColor(GaussianModelVis):
 class GaussianModelTrain(GaussianModelBase):
     def __init__(self, opt, load_dir, mesh, train=True, vertices=None) -> None:
         super().__init__(opt, load_dir, mesh, train)
-        self.sh = opt.sh
+        self.sh = self.appearance_mode == "sh"
         self._lambda = opt.lambda_initial
         vertices = mesh.vertices
 
@@ -245,11 +349,30 @@ class GaussianModelTrain(GaussianModelBase):
         self._colors = nn.Parameter(
             inverse_sigmoid(
                 torch.ones(self.count, 3).float().cuda() - 0.5
-            ).requires_grad_(not self.sh)
+            ).requires_grad_(self.appearance_mode == "rgb")
         )
         fused_color = RGB2SH(
             torch.tensor(torch.ones(self.count, 3) - 0.5).float().cuda()
         )
+
+        self._albedo = nn.Parameter(
+            inverse_sigmoid(
+                torch.full((self.count, 3), 0.5, device="cuda")
+            ).requires_grad_(self.appearance_mode == "pbr")
+        )
+
+        self._roughness = nn.Parameter(
+            inverse_sigmoid(
+                torch.full((self.count, 1), 0.5, device="cuda")
+            ).requires_grad_(self.appearance_mode == "pbr")
+        )
+
+        self._metallic = nn.Parameter(
+            inverse_sigmoid(
+                torch.full((self.count, 1), 0.05, device="cuda")
+            ).requires_grad_(self.appearance_mode == "pbr")
+        )
+
         features = (
             torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2))
             .float()
@@ -258,10 +381,16 @@ class GaussianModelTrain(GaussianModelBase):
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
         self._features_dc = nn.Parameter(
-            features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(self.sh)
+            features[:, :, 0:1]
+            .transpose(1, 2)
+            .contiguous()
+            .requires_grad_(self.appearance_mode == "sh")
         )
         self._features_rest = nn.Parameter(
-            features[:, :, 1:].transpose(1, 2).contiguous().requires_grad_(self.sh)
+            features[:, :, 1:]
+            .transpose(1, 2)
+            .contiguous()
+            .requires_grad_(self.appearance_mode == "sh")
         )
         self._opacity = nn.Parameter(
             inverse_sigmoid(
@@ -371,11 +500,22 @@ class GaussianModelTrain(GaussianModelBase):
         new_offset = torch.zeros((new_faces.shape[0], 1), device=device)
         new_color = torch.rand((new_faces.shape[0], 3), device=device)
         new_features_dc, new_features_rest = None, None
-        if self.sh:
+        new_albedo, new_roughness, new_metallic = None, None, None
+        if self.appearance_mode == "sh":
             new_features_dc = RGB2SH(new_color)[:, :3, 0:1]
             new_features_rest = torch.zeros(
                 (new_faces.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1),
                 device=device,
+            )
+        if self.appearance_mode == "pbr":
+            new_albedo = inverse_sigmoid(
+                torch.full((new_faces.shape[0], 3), 0.5, device=device)
+            )
+            new_roughness = inverse_sigmoid(
+                torch.full((new_faces.shape[0], 1), 0.5, device=device)
+            )
+            new_metallic = inverse_sigmoid(
+                torch.full((new_faces.shape[0], 1), 0.05, device=device)
             )
         new_opacity = inverse_sigmoid(
             torch.ones((new_faces.shape[0], 1), device=device) * 0.9
@@ -400,6 +540,9 @@ class GaussianModelTrain(GaussianModelBase):
             new_tmp_radii,
             new_features_dc,
             new_features_rest,
+            new_albedo,
+            new_roughness,
+            new_metallic,
         )
 
     def calculate_face_area(self, vertices=None):
@@ -423,22 +566,32 @@ class GaussianModelTrain(GaussianModelBase):
 
     @torch.no_grad()
     def capture(self, name):
-        torch.save(
-            (
-                self.get_vertices,
-                self._offset,
-                self._colors,
-                self._features_dc,
-                self._features_rest,
-                self.scales,
-                self._opacity,
-                self._rotation,
-                self.faces,
-                self.indices,
-                self.curr_bary,
+        checkpoint = {
+            "format_version": 2,
+            "appearance_mode": self.appearance_mode,
+
+            "vertices": self.get_vertices,
+            "offset": self._offset,
+            "colors": self._colors if self.appearance_mode == "rgb" else None,
+            "features_dc": (
+                self._features_dc if self.appearance_mode == "sh" else None
             ),
-            name,
-        )
+            "features_rest": (
+                self._features_rest if self.appearance_mode == "sh" else None
+            ),
+            "scales": self.scales,
+            "opacity": self._opacity,
+            "rotation": self._rotation,
+            "faces": self.faces,
+            "indices": self.indices,
+            "curr_bary": self.curr_bary,
+
+            "albedo": self._albedo,
+            "roughness": self._roughness,
+            "metallic": self._metallic,
+        }
+
+        torch.save(checkpoint, name)
 
     @torch.no_grad()
     def update_triangle(self):
@@ -512,7 +665,7 @@ class GaussianModelTrain(GaussianModelBase):
             },
             {"params": [self.curr_bary], "lr": 0.0001, "name": "bary"},
         ]
-        if self.sh:
+        if self.appearance_mode == "sh":
             l.append(
                 {
                     "params": [self._features_dc],
@@ -527,13 +680,32 @@ class GaussianModelTrain(GaussianModelBase):
                     "name": "f_rest",
                 }
             )
-        else:
+        elif self.appearance_mode == "rgb":
             l.append(
                 {
                     "params": [self._colors],
                     "lr": self.optim_params.feature_lr,
                     "name": "f_dc",
                 }
+            )
+        elif self.appearance_mode == "pbr":
+            l.extend(
+                [
+                    {   "params": [self._albedo], 
+                        "lr": 0.005, 
+                        "name": "albedo",
+                    },
+                    {
+                        "params": [self._roughness],
+                        "lr": 0.001,
+                        "name": "roughness",
+                    },
+                    {
+                        "params": [self._metallic],
+                        "lr": 0.001,
+                        "name": "metallic",
+                    },
+                ]
             )
 
         self.optimizer = torch.optim.Adam(l, eps=1e-15)
@@ -579,9 +751,22 @@ class GaussianModelTrain(GaussianModelBase):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
+        count_before = int(self.indices.shape[0])
+        valid_grad_mask = self.denom.squeeze(-1) > 0
+        valid_grads = grads.squeeze(-1)[valid_grad_mask]
+        if valid_grads.numel() > 0:
+            grad_mean = float(valid_grads.mean().item())
+            grad_p99 = float(torch.quantile(valid_grads, 0.99).item())
+            grad_max = float(valid_grads.max().item())
+        else:
+            grad_mean = 0.0
+            grad_p99 = 0.0
+            grad_max = 0.0
+
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        clone_count = self.densify_and_clone(grads, max_grad, extent)
+        split_parent_count = self.densify_and_split(grads, max_grad, extent)
+        count_after_densify = int(self.indices.shape[0])
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
@@ -590,10 +775,28 @@ class GaussianModelTrain(GaussianModelBase):
             prune_mask = torch.logical_or(
                 torch.logical_or(prune_mask, big_points_vs), big_points_ws
             )
+        prune_count = int(prune_mask.sum().item())
         self.prune_points(prune_mask)
+        count_after = int(self.indices.shape[0])
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
+
+        return {
+            "count_before": count_before,
+            "valid_grad_count": int(valid_grads.numel()),
+            "grad_mean": grad_mean,
+            "grad_p99": grad_p99,
+            "grad_max": grad_max,
+            "grad_threshold": float(max_grad),
+            "clone_count": clone_count,
+            "split_parent_count": split_parent_count,
+            "split_child_count": 2 * split_parent_count,
+            "count_after_densify": count_after_densify,
+            "prune_count": prune_count,
+            "count_after": count_after,
+            "net_change": count_after - count_before,
+        }
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -638,15 +841,21 @@ class GaussianModelTrain(GaussianModelBase):
         optimizable_tensors = self._prune_optimizer(valid_points_mask)
 
         self._offset = optimizable_tensors["offset"]
-        if not self.sh:
+        if self.appearance_mode == "rgb":
             self._colors = optimizable_tensors["f_dc"]
-        else:
+        elif self.appearance_mode == "sh":
             self._features_dc = optimizable_tensors["f_dc"]
             self._features_rest = optimizable_tensors["f_rest"]
+        elif self.appearance_mode == "pbr":
+            self._albedo = optimizable_tensors["albedo"]
+            self._roughness = optimizable_tensors["roughness"]
+            self._metallic = optimizable_tensors["metallic"]
         self._opacity = optimizable_tensors["opacity"]
         self.curr_bary = optimizable_tensors["bary"]
         self._rotation = optimizable_tensors["rotation"]
         self.scales = optimizable_tensors["scaling"]
+
+        self.count = len(self.scales)
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -656,9 +865,13 @@ class GaussianModelTrain(GaussianModelBase):
 
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
-        target_group = ["offset", "f_dc", "opacity", "rotation", "bary", "scaling"]
-        if self.sh:
-            target_group.append("f_rest")
+        target_group = ["offset", "opacity", "rotation", "bary", "scaling"]
+        if self.appearance_mode == "rgb":
+            target_group.append("f_dc")
+        elif self.appearance_mode == "sh":
+            target_group.extend(["f_dc", "f_rest"])
+        elif self.appearance_mode == "pbr":
+            target_group.extend(["albedo", "roughness", "metallic"])
         for group in self.optimizer.param_groups:
             if group["name"] not in target_group:
                 continue
@@ -695,6 +908,7 @@ class GaussianModelTrain(GaussianModelBase):
             torch.max(self.get_scaling, dim=1).values
             > self.percent_dense * scene_extent,
         )
+        selected_count = int(selected_pts_mask.sum().item())
 
         stds = 0.05 * torch.ones((selected_pts_mask.sum(), 2), device="cuda")
         means = torch.zeros((stds.size(0), 2), device="cuda")
@@ -710,13 +924,18 @@ class GaussianModelTrain(GaussianModelBase):
             N, 1, 1
         )
         new_color = None
-        if not self.sh:
+        if self.appearance_mode == "rgb":
             new_color = self._colors[selected_pts_mask].repeat(N, 1)
         new_features_dc = None
         new_features_rest = None
-        if self.sh:
+        if self.appearance_mode == "sh":
             new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
             new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_albedo, new_roughness, new_metallic = None, None, None
+        if self.appearance_mode == "pbr":
+            new_albedo = self._albedo[selected_pts_mask].repeat(N, 1)
+            new_roughness = self._roughness[selected_pts_mask].repeat(N, 1)
+            new_metallic = self._metallic[selected_pts_mask].repeat(N, 1)
         new_offset = self._offset[selected_pts_mask].repeat(N, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
@@ -734,6 +953,9 @@ class GaussianModelTrain(GaussianModelBase):
             new_tmp_radii,
             new_features_dc,
             new_features_rest,
+            new_albedo,
+            new_roughness,
+            new_metallic,
         )
 
         prune_filter = torch.cat(
@@ -743,6 +965,7 @@ class GaussianModelTrain(GaussianModelBase):
             )
         )
         self.prune_points(prune_filter)
+        return selected_count
 
     def densification_postfix(
         self,
@@ -755,25 +978,46 @@ class GaussianModelTrain(GaussianModelBase):
         new_tmp_radii,
         new_features_dc=None,
         new_features_rest=None,
+        new_albedo=None,
+        new_roughness=None,
+        new_metallic=None,
     ):
         d = {
             "offset": new_offset,
-            "f_dc": new_color if not self.sh else new_features_dc,
             "opacity": new_opacity,
             "rotation": new_rotation,
             "scaling": new_scaling,
             "bary": new_bary,
         }
-        if self.sh:
-            d["f_rest"] = new_features_rest
+        if self.appearance_mode == "rgb":
+            d["f_dc"] = new_color
+        elif self.appearance_mode == "sh":
+            d.update(
+                {
+                    "f_dc": new_features_dc,
+                    "f_rest": new_features_rest,
+                }
+            )
+        elif self.appearance_mode == "pbr":
+            d.update(
+                {
+                    "albedo": new_albedo,
+                    "roughness": new_roughness,
+                    "metallic": new_metallic,
+                }
+            )
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._offset = optimizable_tensors["offset"]
-        if self.sh:
+        if self.appearance_mode == "sh":
             self._features_dc = optimizable_tensors["f_dc"]
             self._features_rest = optimizable_tensors["f_rest"]
-        else:
+        elif self.appearance_mode == "rgb":
             self._colors = optimizable_tensors["f_dc"]
+        elif self.appearance_mode == "pbr":
+            self._albedo = optimizable_tensors["albedo"]
+            self._roughness = optimizable_tensors["roughness"]
+            self._metallic = optimizable_tensors["metallic"]
         self._opacity = optimizable_tensors["opacity"]
         self.curr_bary = optimizable_tensors["bary"]
         self._rotation = optimizable_tensors["rotation"]
@@ -795,19 +1039,25 @@ class GaussianModelTrain(GaussianModelBase):
             torch.max(self.get_scaling, dim=1).values
             <= self.percent_dense * scene_extent,
         )
+        selected_count = int(selected_pts_mask.sum().item())
 
         new_scaling = self.scales[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_bary = self.curr_bary[selected_pts_mask]
         new_color = None
-        if not self.sh:
+        if self.appearance_mode == "rgb":
             new_color = self._colors[selected_pts_mask]
-        if self.sh:
+        if self.appearance_mode == "sh":
             new_features_dc = self._features_dc[selected_pts_mask]
             new_features_rest = self._features_rest[selected_pts_mask]
         else:
             new_features_dc = None
             new_features_rest = None
+        new_albedo, new_roughness, new_metallic = None, None, None
+        if self.appearance_mode == "pbr":
+            new_albedo = self._albedo[selected_pts_mask]
+            new_roughness = self._roughness[selected_pts_mask]
+            new_metallic = self._metallic[selected_pts_mask]
         new_offset = self._offset[selected_pts_mask]
         new_opacity = self._opacity[selected_pts_mask]
 
@@ -826,7 +1076,11 @@ class GaussianModelTrain(GaussianModelBase):
             new_tmp_radii,
             new_features_dc,
             new_features_rest,
+            new_albedo,
+            new_roughness,
+            new_metallic,
         )
+        return selected_count
 
     def reset_opacity(self):
         op = self.get_opacity
@@ -887,9 +1141,6 @@ class GaussianModelTrain(GaussianModelBase):
 
     def project_property_to_uv(self, opt):
         reso = opt.target_size
-        texture_map = torch.zeros((reso, reso, 4)).float().cuda()
-        normal_map = torch.zeros((reso, reso, 3)).float().cuda()
-        displacement_map = torch.zeros((reso, reso, 1)).float().cuda()
         vertices = self.get_vertices
         normals_faces = self.get_face_normals(vertices[self.face_t])
         normals_all = self.get_face_normals(vertices[self.indices])
@@ -898,12 +1149,16 @@ class GaussianModelTrain(GaussianModelBase):
         scales_all = self.get_scaling[..., :2]
         opacities_all = self.get_opacity
         offsets_all = self._offset
-        colors_all = self.get_colors()
-        if self.sh:
+        if self.appearance_mode == "sh":
+            colors_all = self.get_colors()
             shs_view = colors_all.transpose(1, 2).view(-1, 3, 16)
             dir_pp_normalized = -normals_all
             sh2rgb = eval_sh(self.max_sh_degree, shs_view, dir_pp_normalized)
             colors_all = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        elif self.appearance_mode == "rgb":
+            colors_all = self.get_colors()
+        else:
+            colors_all = self.get_albedo
         j_indices = torch.arange(len(self.face_t)).cuda()
         j_starts = torch.searchsorted(self.face_indices_t, j_indices, right=False)
         j_ends = torch.searchsorted(self.face_indices_t, j_indices, right=True)
@@ -912,8 +1167,8 @@ class GaussianModelTrain(GaussianModelBase):
         gs_f_high = torch.searchsorted(
             values, torch.arange(values[-1] + 1).cuda(), right=True
         )
-        texture_map, normal_map, displacement_map, torch_map = (
-            gaussian_splat_mesh.gaussian_splat_mesh_cuda(
+        def project_values(values):
+            return gaussian_splat_mesh.gaussian_splat_mesh_cuda(
                 vertices,
                 self.face_verts.to(torch.int),
                 normals_faces,
@@ -926,7 +1181,7 @@ class GaussianModelTrain(GaussianModelBase):
                 rotations_all,
                 scales_all,
                 offsets_all,
-                colors_all,
+                values,
                 opacities_all,
                 self.face_indices_t.to(torch.int),
                 self.barycentrics_t,
@@ -936,7 +1191,8 @@ class GaussianModelTrain(GaussianModelBase):
                 reso,
                 1,
             )
-        )
+
+        texture_map, normal_map, displacement_map, _ = project_values(colors_all)
         expected_displacement = displacement_map[..., [0]]
         expected_displacement /= texture_map[..., [3]].clamp_min(1e-6)
         median_displacement = displacement_map[..., [1]]
@@ -945,8 +1201,33 @@ class GaussianModelTrain(GaussianModelBase):
             median * median_displacement + (1 - median) * expected_displacement
         )
         normal_map = torch.nn.functional.normalize(normal_map, p=2, dim=-1)
-        return (
-            self.fill_map(texture_map),
-            self.fill_map(normal_map),
-            self.fill_map(displacement_map),
-        )
+        result = {
+            "normal": self.fill_map(normal_map),
+            "displacement": self.fill_map(displacement_map),
+        }
+
+        if self.appearance_mode != "pbr":
+            result["texture"] = self.fill_map(texture_map)
+            return result
+
+        def normalize_projected_material(projected):
+            alpha = projected[..., [3]]
+            material = projected[..., :3] / alpha.clamp_min(1e-6)
+            material = torch.where(alpha > 0, material, torch.zeros_like(material))
+            return self.fill_map(material)
+
+        result["albedo"] = normalize_projected_material(texture_map)
+
+        roughness_values = self.get_roughness.expand(-1, 3)
+        roughness_projected, _, _, _ = project_values(roughness_values)
+        result["roughness"] = normalize_projected_material(
+            roughness_projected
+        )[..., [0]]
+
+        metallic_values = self.get_metallic.expand(-1, 3)
+        metallic_projected, _, _, _ = project_values(metallic_values)
+        result["metallic"] = normalize_projected_material(
+            metallic_projected
+        )[..., [0]]
+
+        return result

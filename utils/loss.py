@@ -1,8 +1,21 @@
-def normal_error(label, predict):
-    dot = (1 - (label * predict).sum(dim=0)).mean()
-    diff = l2(label, predict)
-    return dot + diff
+def normal_error(label, predict, mask=None):
+    # H × W
+    dot = 1 - (label * predict).sum(dim=0)
 
+    # H × W
+    diff = ((label - predict) ** 2).mean(dim=0)
+
+    error = dot + diff
+
+    if mask is None:
+        return error.mean()
+
+    mask = mask.squeeze().bool()
+
+    if not mask.any():
+        return error.sum() * 0.0
+
+    return error[mask].mean()
 
 def l2(label, predict):
     return ((label - predict) ** 2).mean()

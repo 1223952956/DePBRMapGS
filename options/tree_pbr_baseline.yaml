@@ -1,0 +1,59 @@
+# datapath
+rootpath: "/mimlab/ren/project/demapgs/DeMapGS"
+dataset: "blender"
+scene: "tree"
+
+# Independent output for the first PBR baseline training run.
+exp: "tree_pbr_baseline"
+group: "output-blender"
+
+# Higher-resolution final material maps than the smoke tests.
+target_size: 2048
+
+### visualization ###
+vis_idx: [1]
+
+### optimization ###
+cuda: 0
+distance: true
+lambda_initial: 1
+pos_scale: 1
+
+### application ###
+vis: false
+app: "vis"
+other_path: ""
+
+### PBR appearance ###
+appearance_mode: "pbr"
+
+### lighting ###
+num_lights: 8
+light_start_iter: 200
+light_direction_lr: 0.0001
+light_lr: 0.001
+exposure_lr: 0.001
+white_balance_lr: 0.0005
+
+### baseline schedule ###
+# First stabilize the global mesh transform, then optimize local parameters.
+global_iter: 200
+deform_iter: 1000
+
+# Keep the baseline on the already-tested 2DGS PBR renderer.
+d_iter: 15000
+no_3d: true
+
+# Stop vertex realignment halfway through training.
+vertice_iter: 5000
+
+# Enable masked surface-normal and distortion losses for the final 2000 steps.
+last_iter: 2000
+total_iter: 10000
+
+# The initial mesh already carries 380k Gaussians. Disable lifecycle changes
+# for this baseline so material quality is evaluated independently of split.
+enable_densification: false
+
+### legacy compatibility ###
+sh: false

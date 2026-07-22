@@ -25,26 +25,48 @@ loss_weights = {
     "gt_normal": 1,
     "distortion": 0.01,
     "reg": 50,
+
+    "light_scale": 0.01,
+    "exposure_reg": 0.001,
+    "white_balance_reg": 0.001,
 }
 
 
-def render(gaussian_vals, calib, bg):
+def render(gaussian_vals, calib, bg, lighting=None):
     global rendergs
 
     render_ret = rendergs(
-        gaussian_vals, bg, calib["extr"], calib["intr"], calib["width"], calib["height"]
+        gaussian_vals, bg, calib["extr"], calib["intr"], calib["width"], calib["height"], lighting=lighting
     )
     return render_ret
 
+def srgb_to_linear(x):
+    return torch.where(
+        x <= 0.04045,
+        x / 12.92,
+        ((x + 0.055) / 1.055).pow(2.4),
+    )
 
-def color_iter(opt, gaussian_model, data, vgg, iter):
+def color_iter(opt, gaussian_model, data, vgg, view_idx, iter, lighting_model=None):
     gaussian_model.optimizer.zero_grad()
     gaussian_model.optimizer_g.zero_grad()
+    if lighting_model is not None:
+        lighting_model.optimizer.zero_grad()
     gaussian_vals = gaussian_model.get_gaussian_vals()
     bg = torch.rand(3).float().cuda()
-    gt_img = data.img.clone()
+
+    if gaussian_model.appearance_mode == "pbr":
+        gt_img = srgb_to_linear(data.img.clamp(0, 1))
+    else:
+        gt_img = data.img.clone()
+
     gt_img[~data.mask] = bg
-    render_ret = render(gaussian_vals, data.camera, bg)
+
+    lighting = None
+    if lighting_model is not None:
+        lighting = lighting_model.get_light(view_idx)
+
+    render_ret = render(gaussian_vals, data.camera, bg, lighting=lighting)
     viewspace_point_tensor = render_ret["viewspace_points"]
     visibility_filter = render_ret["visibility_filter"]
     radii = render_ret["radii"]
@@ -56,21 +78,47 @@ def color_iter(opt, gaussian_model, data, vgg, iter):
         else torch.tensor(0).cuda().float(),
     }
     if not gaussian_model.threed:
+        normal_mask = (
+            render_ret["rend_alpha"][0].detach() > 0.01
+        )
+
         losses.update(
             {
                 "surf_normal": normal_error(
-                    render_ret["rend_normal"], render_ret["surf_normal"]
+                    render_ret["rend_normal"],
+                    render_ret["surf_normal"],
+                    normal_mask,
                 )
                 if iter > opt.total_iter - opt.last_iter
                 else torch.tensor(0).cuda().float(),
                 "gt_normal": normal_error(
-                    data.normal.permute(2, 0, 1), render_ret["rend_normal"]
+                    data.normal.permute(2, 0, 1),
+                    render_ret["rend_normal"],
+                    data.mask,
                 )
                 if data.normal is not None
                 else torch.tensor(0).cuda(),
                 "distortion": render_ret["rend_dist"].mean()
                 if iter > opt.total_iter - opt.last_iter
                 else torch.tensor(0).cuda().float(),
+            }
+        )
+    if lighting_model is not None:
+        light_losses = lighting_model.regularization()
+
+        losses.update(
+            {
+                "light_scale": light_losses["light_scale"],
+                "exposure_reg": (
+                    light_losses["exposure_mean"]
+                    + 0.1
+                    * light_losses["exposure_variance"]
+                ),
+                "white_balance_reg": (
+                    light_losses["white_balance_mean"]
+                    + 0.1
+                    * light_losses["white_balance_variance"]
+                ),
             }
         )
     global loss_weights
@@ -81,6 +129,11 @@ def color_iter(opt, gaussian_model, data, vgg, iter):
     if iter > opt.global_iter:
         gaussian_model.optimizer.step()
         gaussian_model.update_learning_rate(iter)
+    if (
+        lighting_model is not None
+        and iter > opt.get("light_start_iter", 500)
+    ):
+        lighting_model.optimizer.step()
     if iter > 2000:
         gaussian_model.update_global_rate()
     if iter < opt.vertice_iter:
@@ -104,14 +157,35 @@ def color_iter(opt, gaussian_model, data, vgg, iter):
     gaussian_model.update_triangle()
     ### densification and pruning
     if (
-        (iter > opt.deform_iter)
+        opt.get("enable_densification", True)
+        and (iter > opt.deform_iter)
         and (iter < opt.total_iter - 5000)
         and ((iter % 200) == 0)
     ):
         size_threshold = 20 if iter > 3000 else None
-        gaussian_model.densify_and_prune(0.0001, 0.005, 5, size_threshold, radii)
+        densify_stats = gaussian_model.densify_and_prune(
+            0.0001, 0.005, 5, size_threshold, radii
+        )
+        for name, value in densify_stats.items():
+            writer.add_scalar(f"densify/{name}", value, iter)
+        tqdm.write(
+            "[densify] "
+            f"iter={iter} "
+            f"count={densify_stats['count_before']}"
+            f"->{densify_stats['count_after_densify']}"
+            f"->{densify_stats['count_after']} "
+            f"clone={densify_stats['clone_count']} "
+            f"split_parents={densify_stats['split_parent_count']} "
+            f"split_children={densify_stats['split_child_count']} "
+            f"prune={densify_stats['prune_count']} "
+            f"valid_grads={densify_stats['valid_grad_count']} "
+            f"grad_mean={densify_stats['grad_mean']:.3e} "
+            f"grad_p99={densify_stats['grad_p99']:.3e} "
+            f"grad_max={densify_stats['grad_max']:.3e}"
+        )
     if (
-        (iter > opt.deform_iter)
+        opt.get("enable_densification", True)
+        and (iter > opt.deform_iter)
         and ((iter + 1) % 2000 == 0)
         and (iter < opt.total_iter - 10000)
     ):
@@ -119,7 +193,7 @@ def color_iter(opt, gaussian_model, data, vgg, iter):
     return losses
 
 
-def train(opt, gaussian_model, train_data, writer, map_mask=None):
+def train(opt, gaussian_model, train_data, writer, map_mask=None, lighting_model=None):
     global rendergs
     if opt.mode == "no-3d":
         print("not using 3dgs")
@@ -127,6 +201,10 @@ def train(opt, gaussian_model, train_data, writer, map_mask=None):
     output_dir = f"{opt.group}/{opt.exp}"
     os.makedirs(output_dir, exist_ok=True)
     gaussian_model.training_setup()
+
+    if lighting_model is not None:
+        lighting_model.training_setup(opt)
+
     all_iteration = opt.total_iter
     progress = tqdm(range(all_iteration))
     stack = []
@@ -135,7 +213,7 @@ def train(opt, gaussian_model, train_data, writer, map_mask=None):
     os.makedirs(opt.img_save_dir, exist_ok=True)
     for iter in progress:
         if (iter == 0) or ((iter + 1) % 5000 == 0):
-            evaluate(opt, gaussian_model, train_data, writer, iter)
+            evaluate(opt, gaussian_model, train_data, writer, iter, lighting_model)
             save_properties(opt, output_dir, gaussian_model, train_data, writer, iter)
         if not opt.no_3d:
             if iter == opt.total_iter - opt.last_iter:
@@ -156,7 +234,7 @@ def train(opt, gaussian_model, train_data, writer, map_mask=None):
             stack = torch.randperm(len(train_data)).squeeze().tolist()
         idx = stack.pop()
         data = train_data[idx]
-        losses = color_iter(opt, gaussian_model, data, vgg, iter)
+        losses = color_iter(opt, gaussian_model, data, vgg, idx, iter, lighting_model)
         progress.set_postfix(
             {key: f"{item.tolist():.03f}" for key, item in losses.items()}
         )
@@ -171,6 +249,16 @@ def train(opt, gaussian_model, train_data, writer, map_mask=None):
             gaussian_model.scales.requires_grad = True
     save_properties(opt, output_dir, gaussian_model, train_data, writer, iter)
     gaussian_model.capture(f"{output_dir}/model.ckpt")
+    if lighting_model is not None:
+        torch.save(
+            {
+                "model": lighting_model.state_dict(),
+                "optimizer": lighting_model.optimizer.state_dict(),
+                "num_lights": opt.get("num_lights", 8),
+                "num_views": len(train_data),
+            },
+            f"{output_dir}/lighting.ckpt",
+        )
 
 
 @torch.no_grad()
@@ -209,10 +297,35 @@ def save_properties(opt, output_dir, gaussian_model, train_data, writer, iter):
             edge_img.clamp(0, 1).cpu().numpy(),
         )
     if iter > opt.total_iter * 0.9:
-        texture_map, normal_map, displacement_map = (
-            gaussian_model.project_property_to_uv(opt)
-        )
-        plt.imsave(f"{output_dir}/texture.png", texture_map.clamp(0, 1).cpu().numpy())
+        property_maps = gaussian_model.project_property_to_uv(opt)
+
+        if gaussian_model.appearance_mode == "pbr":
+            plt.imsave(
+                f"{output_dir}/albedo.png",
+                property_maps["albedo"].clamp(0, 1).cpu().numpy(),
+            )
+            plt.imsave(
+                f"{output_dir}/roughness.png",
+                property_maps["roughness"].squeeze(-1).clamp(0, 1).cpu().numpy(),
+                cmap="gray",
+                vmin=0,
+                vmax=1,
+            )
+            plt.imsave(
+                f"{output_dir}/metallic.png",
+                property_maps["metallic"].squeeze(-1).clamp(0, 1).cpu().numpy(),
+                cmap="gray",
+                vmin=0,
+                vmax=1,
+            )
+        else:
+            plt.imsave(
+                f"{output_dir}/texture.png",
+                property_maps["texture"].clamp(0, 1).cpu().numpy(),
+            )
+
+        normal_map = property_maps["normal"]
+        displacement_map = property_maps["displacement"]
         plt.imsave(f"{output_dir}/normal.png", (normal_map / 2 + 0.5).cpu().numpy())
         np.save(
             f"{output_dir}/displacement.npy", displacement_map.squeeze().cpu().numpy()
@@ -227,16 +340,26 @@ def save_properties(opt, output_dir, gaussian_model, train_data, writer, iter):
 
 
 @torch.no_grad()
-def evaluate(opt, gaussian_model, train_data, writer, iter):
+def evaluate(opt, gaussian_model, train_data, writer, iter, lighting_model=None):
     gaussian_vals = gaussian_model.get_gaussian_vals()
     bg = torch.ones(3).float().cuda()
     for idx in opt.vis_idx:
         data = train_data[idx]
-        data.img[~data.mask] = 1
+        gt_img = data.img.clone()
+        gt_img[~data.mask] = 1
+
+        lighting = None
+        if lighting_model is not None:
+            lighting = lighting_model.get_light(idx)
+
         count = iter + 1
-        render_ret = render(gaussian_vals, data.camera, bg)
+        render_ret = render(gaussian_vals, data.camera, bg, lighting=lighting)
         writer.add_image(f"render/rgb-{idx}", render_ret["render"], iter)
-        writer.add_image(f"render/gt-{idx}", data.img.permute(2, 0, 1), iter)
+        writer.add_image(
+            f"render/gt-{idx}",
+            gt_img.permute(2, 0, 1),
+            iter,
+        )
         if not gaussian_model.threed:
             h, w = render_ret["rend_normal"].shape[1:]
             render_ret["rend_normal"] = (
@@ -308,6 +431,10 @@ if __name__ == "__main__":
     torch.set_default_device(f"cuda:{opt.cuda}")
 
     train_data = load_dataset(opt)
+    if train_data is None:
+        raise ValueError(
+            f"Unsupported dataset: {opt.dataset}"
+        )
     mesh = train_data.load_mesh(opt)
 
     from gaussians.render_2dgs import render3
@@ -316,9 +443,18 @@ if __name__ == "__main__":
     if not opt.vis:
         writer = SummaryWriter(f"{opt.group}/{opt.exp}")
         from gaussians.gaussian_model import GaussianModelTrain
+        from gaussians.lighting_model import LightingModel
 
         gaussian_model = GaussianModelTrain(opt, "not loading", mesh)
-        train(opt, gaussian_model, train_data, writer)
+
+        lighting_model = None
+        if opt.appearance_mode == "pbr":
+            lighting_model = LightingModel(
+                num_lights=opt.get("num_lights", 8),
+                num_views=len(train_data),
+            ).cuda()
+
+        train(opt, gaussian_model, train_data, writer, lighting_model=lighting_model)
     else:
         if opt.app == "vis":
             from gaussians.gaussian_model import GaussianModelVis

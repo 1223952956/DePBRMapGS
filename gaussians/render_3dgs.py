@@ -17,6 +17,7 @@ from diff_gaussian_rasterization import (
 )
 from utils.graphics import focal2fov, getProjectionMatrix
 from utils.sh import eval_sh
+from utils.pbr import shade_pbr
 
 
 def render3(
@@ -27,6 +28,7 @@ def render3(
     img_w: int,
     img_h: int,
     scaling_modifier=1.0,
+    lighting=None
 ):
     means3D = gaussian_vals["positions"]
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
@@ -87,7 +89,22 @@ def render3(
     assert not ("colors" in gaussian_vals and "shs" in gaussian_vals), (
         "Cannot use both color and SH!"
     )
-    if "colors" in gaussian_vals:
+    if "albedo" in gaussian_vals:
+        if lighting is None:
+            raise ValueError(
+                "PBR rendering requires lighting"
+            )
+
+        colors_precomp = shade_pbr(
+            positions=means3D,
+            normals=gaussian_vals["normals"],
+            albedo=gaussian_vals["albedo"],
+            roughness=gaussian_vals["roughness"],
+            metallic=gaussian_vals["metallic"],
+            camera_position=camera_center,
+            lighting=lighting,
+        )
+    elif "colors" in gaussian_vals:
         colors_precomp = gaussian_vals["colors"]
     else:
         colors_precomp = None
